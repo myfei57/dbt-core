@@ -73,6 +73,7 @@ class MethodName(StrEnum):
     SavedQuery = "saved_query"
     UnitTest = "unit_test"
     Selector = "selector"
+    Boundary = "boundary"
 
 
 def is_selected_node(fqn: List[str], node_selector: str, is_versioned: bool) -> bool:
@@ -984,8 +985,9 @@ class SelectorSelectorMethod(SelectorMethod):
         *,
         get_selected_callback: Callable[..., Set[UniqueId]],
         selectors: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(manifest, previous_state, arguments)
+        super().__init__(manifest, previous_state, arguments, **kwargs)
         self._selectors = selectors
         self._get_selected_callback = get_selected_callback
 
@@ -1036,6 +1038,131 @@ class SelectorSelectorMethod(SelectorMethod):
             sys.setrecursionlimit(original_limit)
 
 
+class BoundaryDirection(StrEnum):
+    Upstream = "upstream"
+    Downstream = "downstream"
+
+
+# A boundary selector wraps another selection definition. In a selectors.yml
+# file it is written as:
+#
+#     definition:
+#       boundary:
+#         direction: upstream   # or "downstream"
+#         definition:
+#           union:
+#             - tag: foo
+#
+# The wrapped definition may also be a single selector string, and the whole
+# thing can be written inline as `boundary:upstream:tag:foo`.
+BoundaryRawDefinition = Union[str, Dict[str, Any]]
+
+
+class BoundarySelectorMethod(SelectorMethod):
+    """Select only the boundary nodes of another node selection.
+
+    The wrapped selection definition is resolved like a named selector, but
+    only its *directly* selected nodes contribute (indirectly selected tests
+    do not). The upstream boundary contains selected nodes that have no direct
+    parent also in the selection, and the downstream boundary contains
+    selected nodes with no direct child also in the selection. Only the real
+    dependency edges stored on the manifest are inspected, so a node outside
+    the selection never bridges two nodes inside it. Nodes with neither an
+    in-selection parent nor an in-selection child belong to both boundaries.
+    """
+
+    def __init__(
+        self,
+        manifest: Manifest,
+        previous_state: Optional[PreviousState],
+        arguments: List[str],
+        *,
+        get_direct_selection_callback: Callable[["SelectionSpec"], Set[UniqueId]],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(manifest, previous_state, arguments, **kwargs)
+        self._get_direct_selection_callback = get_direct_selection_callback
+
+    @staticmethod
+    def _invalid_value(selector: Any) -> DbtRuntimeError:
+        return DbtRuntimeError(
+            f'Invalid boundary selector value "{selector}". Expected either a string '
+            'of the form "upstream:<selector>" / "downstream:<selector>", or a '
+            'dictionary with keys "direction" ("upstream" or "downstream") and '
+            '"definition" (a node selection definition).'
+        )
+
+    @classmethod
+    def _parse_boundary_value(
+        cls, selector: Any
+    ) -> Tuple[BoundaryDirection, BoundaryRawDefinition]:
+        if isinstance(selector, str):
+            direction, separator, raw_definition = selector.partition(":")
+            direction = direction.strip()
+            raw_definition = raw_definition.strip()
+            if not separator or not raw_definition:
+                raise cls._invalid_value(selector)
+            definition: BoundaryRawDefinition = raw_definition
+        elif isinstance(selector, dict):
+            unexpected_keys = sorted(set(selector) - {"direction", "definition"})
+            if unexpected_keys:
+                raise DbtRuntimeError(
+                    f'Invalid boundary selector value "{selector}": unexpected key(s) '
+                    f'{unexpected_keys}; only "direction" and "definition" are supported.'
+                )
+            if "direction" not in selector or "definition" not in selector:
+                raise cls._invalid_value(selector)
+            direction = selector["direction"]
+            definition = selector["definition"]
+            if not isinstance(definition, (str, dict)):
+                raise DbtRuntimeError(
+                    'Invalid boundary selector value: "definition" must be a selector '
+                    f"string or a dictionary, got {type(definition).__name__}: {definition}"
+                )
+        else:
+            raise cls._invalid_value(selector)
+
+        try:
+            boundary_direction = BoundaryDirection(direction)
+        except ValueError:
+            valid_directions = ", ".join(BoundaryDirection)
+            raise DbtRuntimeError(
+                f'Invalid boundary direction "{direction}": expected one of {valid_directions}.'
+            )
+
+        return boundary_direction, definition
+
+    def search(self, included_nodes: Set[UniqueId], selector: Any) -> Iterator[UniqueId]:
+        direction, raw_definition = self._parse_boundary_value(selector)
+
+        # Imported here to avoid a circular import: dbt.graph.cli imports
+        # selector_spec (which imports this module) at package import time.
+        from .cli import parse_from_definition
+
+        wrapped_spec = parse_from_definition(raw_definition)
+        selected = {
+            unique_id
+            for unique_id in self._get_direct_selection_callback(wrapped_spec)
+            if unique_id in included_nodes
+        }
+
+        # An empty selection has no boundary nodes.
+        if not selected:
+            return
+
+        # parent_map / child_map hold the real, direct dependency edges from
+        # the manifest. They are only read, never modified.
+        parent_map: Dict[str, List[str]] = getattr(self.manifest, "parent_map", None) or {}
+        child_map: Dict[str, List[str]] = getattr(self.manifest, "child_map", None) or {}
+        edge_map = parent_map if direction == BoundaryDirection.Upstream else child_map
+
+        for unique_id in selected:
+            # An in-selection neighbor keeps the node off this boundary; an
+            # out-of-selection neighbor does not (no edges are bridged).
+            if not (set(edge_map.get(unique_id, ())) & selected):
+                yield unique_id
+
+
 class MethodManager:
     SELECTOR_METHODS: Dict[MethodName, Type[SelectorMethod]] = {
         MethodName.FQN: QualifiedNameSelectorMethod,
@@ -1060,6 +1187,7 @@ class MethodManager:
         MethodName.SavedQuery: SavedQuerySelectorMethod,
         MethodName.UnitTest: UnitTestSelectorMethod,
         MethodName.Selector: SelectorSelectorMethod,
+        MethodName.Boundary: BoundarySelectorMethod,
     }
 
     def __init__(

@@ -1,6 +1,7 @@
 import os
 import re
 from abc import ABCMeta, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
@@ -220,3 +221,21 @@ class SelectionUnion(BaseSelectionGroup):
         selections: List[Set[UniqueId]],
     ) -> Set[UniqueId]:
         return set.union(*selections)
+
+
+def replace_indirect_selection(
+    spec: SelectionSpec, indirect_selection: IndirectSelection
+) -> SelectionSpec:
+    """Return a deep copy of the spec tree with the indirect selection mode
+    replaced on every selection criteria and set operator. The original spec
+    is left unmodified.
+    """
+    spec_copy = deepcopy(spec)
+
+    def _apply(node: SelectionSpec) -> None:
+        node.indirect_selection = indirect_selection
+        for component in getattr(node, "components", []):
+            _apply(component)
+
+    _apply(spec_copy)
+    return spec_copy

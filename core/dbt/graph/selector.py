@@ -12,7 +12,12 @@ from dbt_common.events.functions import fire_event
 from .graph import Graph, UniqueId
 from .queue import GraphQueue
 from .selector_methods import MethodManager, MethodName
-from .selector_spec import IndirectSelection, SelectionCriteria, SelectionSpec
+from .selector_spec import (
+    IndirectSelection,
+    SelectionCriteria,
+    SelectionSpec,
+    replace_indirect_selection,
+)
 
 
 def get_package_names(nodes):
@@ -62,7 +67,21 @@ class NodeSelector(MethodManager):
             method_arguments,
             selectors=self._selectors,
             get_selected_callback=self.get_selected,
+            get_direct_selection_callback=self.get_direct_selection,
         )
+
+    def get_direct_selection(self, spec: SelectionSpec) -> Set[UniqueId]:
+        """Resolve a spec to its directly selected nodes only.
+
+        Indirectly selected tests are suppressed (IndirectSelection.Empty)
+        so callers (like the ``boundary`` selector method) receive exactly the
+        nodes matched directly by the selection definition. The given spec is
+        not modified, and the result is filtered the same way as a regular
+        selection.
+        """
+        direct_spec = replace_indirect_selection(spec, IndirectSelection.Empty)
+        direct_nodes, _ = self.select_nodes(direct_spec, warn_on_no_nodes=False)
+        return self.filter_selection(direct_nodes)
 
     def select_included(
         self,

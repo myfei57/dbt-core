@@ -1,0 +1,6 @@
+kind: Features
+body: Add a `boundary` selector method that keeps only the upstream or downstream boundary nodes of another node selection
+time: 2026-11-05T09:30:00.000000-06:00
+custom:
+    Author: trae
+    Issue: ""
