@@ -513,6 +513,7 @@ def init(ctx, **kwargs):
 @p.exclude
 @p.models
 @p.output
+@p.output_group_by
 @p.output_keys
 @p.profiles_dir
 @p.project_dir

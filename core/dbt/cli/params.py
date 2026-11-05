@@ -451,9 +451,26 @@ models = _create_option_and_track_env_var(*model_decls, **select_attrs)  # type:
 output = _create_option_and_track_env_var(
     "--output",
     envvar=None,
-    help="Specify the output format: either JSON or a newline-delimited list of selectors, paths, or names",
-    type=click.Choice(["json", "name", "path", "selector"], case_sensitive=False),
+    help=(
+        "Specify the output format: either JSON, a newline-delimited list of selectors, "
+        "paths, or names, or a `count` summary of the selected resources"
+    ),
+    type=click.Choice(["json", "name", "path", "selector", "count"], case_sensitive=False),
     default="selector",
+)
+
+output_group_by = _create_option_and_track_env_var(
+    "--output-group-by",
+    envvar=None,
+    help=(
+        "Group the `count` output summary by `resource_type`, `package`, or both "
+        "(e.g. `--output count --output-group-by resource_type package`). "
+        "Only valid with `--output count`. Defaults to `resource_type`."
+    ),
+    type=ChoiceTuple(["resource_type", "package"], case_sensitive=False),
+    cls=MultiOption,
+    multiple=True,
+    default=(),
 )
 
 output_keys = _create_option_and_track_env_var(

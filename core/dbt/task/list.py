@@ -1,5 +1,5 @@
 import json
-from typing import Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from dbt.artifacts.resources import Catalog
 from dbt.cli.flags import Flags
@@ -58,6 +58,10 @@ class ListTask(GraphRunnableTask):
             "unique_id",
         )
     )
+    # Dimensions supported by `--output count --output-group-by`. The order here
+    # is the canonical order in which group keys are emitted and sorted, so the
+    # summary is stable regardless of the order the user passes the options.
+    COUNT_GROUP_BY_CHOICES = ("resource_type", "package")
 
     def __init__(
         self,
@@ -74,6 +78,8 @@ class ListTask(GraphRunnableTask):
                 raise DbtRuntimeError(
                     '"models" and "resource_type" are mutually exclusive ' "arguments"
                 )
+        if getattr(self.args, "output_group_by", None) and self.args.output != "count":
+            raise DbtRuntimeError('"output_group_by" can only be used with `--output count`')
 
     def _iterate_selected_nodes(self):
         selector = self.get_node_selector()
@@ -189,6 +195,50 @@ class ListTask(GraphRunnableTask):
         for node in self._iterate_selected_nodes():
             yield node.original_file_path
 
+    @property
+    def count_group_by(self) -> Tuple[str, ...]:
+        """Canonical, de-duplicated dimensions for `--output count` grouping.
+
+        Defaults to ("resource_type",) when `--output-group-by` is not given.
+        """
+        requested = set(getattr(self.args, "output_group_by", None) or ())
+        group_by = tuple(dim for dim in self.COUNT_GROUP_BY_CHOICES if dim in requested)
+        return group_by or ("resource_type",)
+
+    def _group_value(self, node: Any, dimension: str) -> str:
+        if dimension == "resource_type":
+            # Sources, models, tests, etc. are always classified by their
+            # actual resource type, not by how they were selected.
+            return str(node.resource_type)
+        if dimension == "package":
+            return node.package_name
+        raise DbtInternalError(f"Invalid count group-by dimension: {dimension}")
+
+    def generate_count_summary(self) -> Iterator[str]:
+        # Node selection already returns a set of unique_ids, so a resource
+        # matched by multiple --select criteria (or an indirectly selected
+        # test) is only present once. Key by unique_id to make the
+        # de-duplication explicit and defensive.
+        selected_nodes: Dict[str, Any] = {}
+        for node in self._iterate_selected_nodes():
+            selected_nodes[node.unique_id] = node
+
+        group_by = self.count_group_by
+        counts: Dict[Tuple[str, ...], int] = {}
+        for node in selected_nodes.values():
+            key = tuple(self._group_value(node, dim) for dim in group_by)
+            counts[key] = counts.get(key, 0) + 1
+
+        # Stable ordering: groups are sorted by the full group key in the
+        # canonical dimension order.
+        groups = []
+        for key in sorted(counts):
+            group: Dict[str, Any] = {dim: value for dim, value in zip(group_by, key)}
+            group["count"] = counts[key]
+            groups.append(group)
+
+        yield json.dumps({"total": len(selected_nodes), "groups": groups}, cls=JSONEncoder)
+
     def run(self):
         # We set up a context manager here with "task_contextvars" because we
         # we need the project_root in compile_manifest.
@@ -203,6 +253,8 @@ class ListTask(GraphRunnableTask):
                 generator = self.generate_json
             elif output == "path":
                 generator = self.generate_paths
+            elif output == "count":
+                generator = self.generate_count_summary
             else:
                 raise DbtInternalError("Invalid output {}".format(output))
 

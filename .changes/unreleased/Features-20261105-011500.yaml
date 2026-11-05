@@ -1,0 +1,8 @@
+kind: Features
+body: Add `--output count` to `dbt list`/`dbt ls` that outputs a JSON summary with the
+  total number of selected resources and counts grouped by resource type, package, or
+  both, via `--output-group-by`
+time: 2026-11-05T01:15:00.000000-06:00
+custom:
+    Author: trae-agent
+    Issue: ""

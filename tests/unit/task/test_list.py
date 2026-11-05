@@ -1,10 +1,15 @@
 import json
 from argparse import Namespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from dbt.flags import get_flags, set_from_args
+from dbt.node_types import NodeType
 from dbt.task.list import ListTask
 from dbt_common.events.types import PrintEvent
+from dbt_common.exceptions import DbtRuntimeError
 from tests.unit.fixtures import generic_test_node, model_node
 
 
@@ -295,3 +300,197 @@ class TestDirectParentsInLsOutput:
         model.direct_parents = ["model.test.upstream"]
 
         assert "direct_parents" not in model.to_dict(omit_none=False)
+
+
+def _count_node(unique_id, resource_type=NodeType.Model, package_name="root"):
+    return SimpleNamespace(
+        unique_id=unique_id,
+        resource_type=resource_type,
+        package_name=package_name,
+    )
+
+
+class TestGenerateCountSummary:
+    """Unit tests for the `--output count` summary generator."""
+
+    def setup_method(self):
+        set_from_args(
+            Namespace(models=None, output="count", output_group_by=()),
+            {},
+        )
+        self.task = ListTask(get_flags(), None, None)
+
+    def _summary(self, nodes, group_by=()):
+        # Flags is a frozen dataclass, so patch the task's args wholesale
+        # rather than mutate the attribute in place.
+        with patch.object(self.task, "args") as mock_args:
+            mock_args.output_group_by = group_by
+            with patch.object(self.task, "_iterate_selected_nodes", return_value=nodes):
+                raw = list(self.task.generate_count_summary())
+        assert len(raw) == 1
+        return json.loads(raw[0])
+
+    def test_default_grouping_by_resource_type(self):
+        nodes = [
+            _count_node("model.root.a", NodeType.Model),
+            _count_node("test.root.t1", NodeType.Test),
+            _count_node("source.root.s.t", NodeType.Source),
+            _count_node("model.root.b", NodeType.Model),
+        ]
+        summary = self._summary(nodes)
+        assert summary == {
+            "total": 4,
+            "groups": [
+                {"resource_type": "model", "count": 2},
+                {"resource_type": "source", "count": 1},
+                {"resource_type": "test", "count": 1},
+            ],
+        }
+
+    def test_grouping_by_package(self):
+        nodes = [
+            _count_node("model.root.a", NodeType.Model, "root"),
+            _count_node("model.pkg_a.a", NodeType.Model, "pkg_a"),
+            _count_node("test.pkg_a.t", NodeType.Test, "pkg_a"),
+            _count_node("model.pkg_b.b", NodeType.Model, "pkg_b"),
+        ]
+        summary = self._summary(nodes, ("package",))
+        assert summary == {
+            "total": 4,
+            "groups": [
+                {"package": "pkg_a", "count": 2},
+                {"package": "pkg_b", "count": 1},
+                {"package": "root", "count": 1},
+            ],
+        }
+
+    def test_grouping_by_resource_type_and_package(self):
+        nodes = [
+            _count_node("model.root.a", NodeType.Model, "root"),
+            _count_node("test.root.t", NodeType.Test, "root"),
+            _count_node("model.pkg_a.a", NodeType.Model, "pkg_a"),
+        ]
+        summary = self._summary(nodes, ("resource_type", "package"))
+        assert summary == {
+            "total": 3,
+            "groups": [
+                {"resource_type": "model", "package": "pkg_a", "count": 1},
+                {"resource_type": "model", "package": "root", "count": 1},
+                {"resource_type": "test", "package": "root", "count": 1},
+            ],
+        }
+
+    def test_group_keys_use_canonical_order(self):
+        # Dimensions passed in reverse order are still emitted and sorted in
+        # the canonical resource_type -> package order.
+        summary = self._summary(
+            [_count_node("model.pkg_a.a", NodeType.Model, "pkg_a")],
+            ("package", "resource_type"),
+        )
+        assert summary == {
+            "total": 1,
+            "groups": [{"resource_type": "model", "package": "pkg_a", "count": 1}],
+        }
+
+    def test_duplicate_dimensions_are_deduplicated(self):
+        with patch.object(self.task, "args") as mock_args:
+            mock_args.output_group_by = ("package", "package")
+            assert self.task.count_group_by == ("package",)
+
+    def test_empty_selection_returns_zero_total_and_empty_groups(self):
+        assert self._summary([]) == {"total": 0, "groups": []}
+
+    def test_resource_hit_multiple_times_is_counted_once(self):
+        # The same unique_id can be yielded via several selection criteria;
+        # it must only contribute once to the total and its group.
+        nodes = [
+            _count_node("model.root.a", NodeType.Model),
+            _count_node("model.root.a", NodeType.Model),
+        ]
+        summary = self._summary(nodes)
+        assert summary == {
+            "total": 1,
+            "groups": [{"resource_type": "model", "count": 1}],
+        }
+
+    def test_resources_classified_by_actual_type(self):
+        nodes = [
+            _count_node("model.root.m", NodeType.Model),
+            _count_node("snapshot.root.s", NodeType.Snapshot),
+            _count_node("seed.root.d", NodeType.Seed),
+            _count_node("source.root.src.tbl", NodeType.Source),
+            _count_node("test.root.t", NodeType.Test),
+            _count_node("exposure.root.e", NodeType.Exposure),
+            _count_node("metric.root.m", NodeType.Metric),
+            _count_node("semantic_model.root.sm", NodeType.SemanticModel),
+            _count_node("saved_query.root.sq", NodeType.SavedQuery),
+            _count_node("unit_test.root.ut", NodeType.Unit),
+        ]
+        summary = self._summary(nodes)
+        assert summary["total"] == 10
+        assert [group["resource_type"] for group in summary["groups"]] == sorted(
+            group["resource_type"] for group in summary["groups"]
+        )
+        assert {group["resource_type"] for group in summary["groups"]} == {
+            "model",
+            "snapshot",
+            "seed",
+            "source",
+            "test",
+            "exposure",
+            "metric",
+            "semantic_model",
+            "saved_query",
+            "unit_test",
+        }
+        assert all(group["count"] == 1 for group in summary["groups"])
+
+    def test_groups_are_stably_sorted(self):
+        nodes = [
+            _count_node("model.c.c", NodeType.Model, "c"),
+            _count_node("model.a.a", NodeType.Model, "a"),
+            _count_node("model.b.b", NodeType.Model, "b"),
+            _count_node("test.a.t", NodeType.Test, "a"),
+        ]
+        summary = self._summary(nodes, ("resource_type", "package"))
+        assert [(g["resource_type"], g["package"]) for g in summary["groups"]] == [
+            ("model", "a"),
+            ("model", "b"),
+            ("model", "c"),
+            ("test", "a"),
+        ]
+
+    def test_output_is_a_single_machine_readable_json_line(self):
+        with patch.object(self.task, "_iterate_selected_nodes", return_value=[]):
+            with patch("dbt.task.list.fire_event") as mock_fire_event:
+                results = self.task.output_results(self.task.generate_count_summary())
+        assert len(results) == 1
+        assert len(mock_fire_event.call_args_list) == 1
+        event = mock_fire_event.call_args_list[0][0][0]
+        assert isinstance(event, PrintEvent)
+        assert json.loads(event.msg) == {"total": 0, "groups": []}
+
+
+class TestCountOutputValidation:
+    def _make_task(self, output, output_group_by=()):
+        set_from_args(
+            Namespace(
+                models=None,
+                output=output,
+                output_group_by=output_group_by,
+            ),
+            {},
+        )
+        return ListTask(get_flags(), None, None)
+
+    def test_group_by_requires_count_output(self):
+        with pytest.raises(DbtRuntimeError, match="output_group_by"):
+            self._make_task("name", output_group_by=("package",))
+
+    def test_group_by_accepted_with_count_output(self):
+        task = self._make_task("count", output_group_by=("package",))
+        assert task.count_group_by == ("package",)
+
+    def test_default_group_by_is_resource_type(self):
+        task = self._make_task("count")
+        assert task.count_group_by == ("resource_type",)
