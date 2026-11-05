@@ -17,10 +17,12 @@ import dbt.parser.manifest
 import dbt.utils
 import dbt_common.exceptions
 from dbt.config.runtime import RuntimeConfig
+from dbt.config.selectors import selector_config_from_data
 from dbt.flags import set_from_args
-from dbt.graph import NodeSelector, parse_difference
+from dbt.graph import NodeSelector, parse_difference, sample_selection
+from dbt.graph.selector_spec import SelectionCriteria
 from dbt.node_types import NodeType
-from tests.unit.utils.manifest import make_manifest, make_model
+from tests.unit.utils.manifest import make_generic_test, make_manifest, make_model
 
 set_from_args(Namespace(WARN_ERROR=False), None)
 
@@ -323,3 +325,247 @@ class TestNodeSelector:
         # Ensure that --indirect-selection empty returns the same result
         spec.indirect_selection = graph_selector.IndirectSelection.Empty
         assert selector.get_selected(spec) == {"model.pkg.model_two"}
+
+
+def _sample_selector(name, count, seed, definition="tag:nightly", **extra):
+    return {
+        "name": name,
+        "definition": {
+            "sample": {"definition": definition, "count": count, "seed": seed, **extra}
+        },
+    }
+
+
+def _sample_config(selectors):
+    return selector_config_from_data({"selectors": selectors})
+
+
+def _build_sample_project(n_models=7, n_multi_parent_tests=0):
+    models = [
+        make_model("pkg", f"model_{i}", "select 1 as id", tags=["nightly"])
+        for i in range(n_models)
+    ]
+    nodes = list(models)
+    single_tests = []
+    for model in models:
+        test = make_generic_test("pkg", "not_null", model, {}, column_name="id", refs=[model])
+        nodes.append(test)
+        single_tests.append(test)
+    multi_tests = []
+    for _ in range(n_multi_parent_tests):
+        test = make_generic_test(
+            "pkg",
+            "relationships",
+            models[1],
+            {},
+            column_name="id",
+            refs=[models[0], models[1]],
+        )
+        nodes.append(test)
+        multi_tests.append(test)
+    manifest = make_manifest(nodes=nodes)
+    graph = dbt.compilation.Linker().get_graph(manifest)
+    return models, single_tests, multi_tests, manifest, graph
+
+
+class TestSampleSelection:
+    def test_sample_selection_helper_is_order_independent(self):
+        candidates = [f"model.pkg.model_{i}" for i in range(10)]
+
+        forward = sample_selection(candidates, 4, 99)
+        backward = sample_selection(list(reversed(candidates)), 4, 99)
+        shuffled = sample_selection(list(reversed(candidates[3:])) + candidates[:3], 4, 99)
+
+        assert forward == backward == shuffled
+        assert len(forward) == 4
+        # duplicate inputs are deduplicated
+        assert sample_selection(candidates + candidates, 4, 99) == forward
+        # different seeds are free to (and do) produce different samples
+        assert sample_selection(candidates, 4, 99) != sample_selection(candidates, 4, 100)
+
+    def test_sample_is_reproducible_distinct_and_restricted(self):
+        cfg = _sample_config([_sample_selector("three", 3, 42, indirect_selection="empty")])
+        models, _, _, manifest, graph = _build_sample_project()
+        model_ids = {m.unique_id for m in models}
+        expected = sample_selection(model_ids, 3, 42)
+
+        selector = NodeSelector(graph, manifest, selectors=cfg)
+        first = selector.get_selected(cfg["three"]["definition"])
+        # a brand-new selector simulates a brand-new dbt process
+        second = NodeSelector(graph, manifest, selectors=cfg).get_selected(
+            cfg["three"]["definition"]
+        )
+
+        assert first == second == expected
+        assert len(first) == 3
+        assert first <= model_ids
+
+    def test_sample_zero_count_returns_empty(self):
+        cfg = _sample_config([_sample_selector("zero", 0, 1, indirect_selection="empty")])
+        models, _, _, manifest, graph = _build_sample_project()
+
+        selected = NodeSelector(graph, manifest, selectors=cfg).get_selected(
+            cfg["zero"]["definition"]
+        )
+
+        assert selected == set()
+
+    def test_sample_count_at_or_above_candidate_count_selects_all(self):
+        cfg = _sample_config(
+            [
+                _sample_selector("exact", 7, 1, indirect_selection="empty"),
+                _sample_selector("more", 100, 1, indirect_selection="empty"),
+            ]
+        )
+        models, _, _, manifest, graph = _build_sample_project()
+        model_ids = {m.unique_id for m in models}
+        selector = NodeSelector(graph, manifest, selectors=cfg)
+
+        assert selector.get_selected(cfg["exact"]["definition"]) == model_ids
+        assert selector.get_selected(cfg["more"]["definition"]) == model_ids
+
+    def test_sample_eager_selection_only_attaches_tests_of_sampled_nodes(self):
+        cfg = _sample_config([_sample_selector("three", 3, 42)])
+        models, tests, _, manifest, graph = _build_sample_project()
+        model_ids = {m.unique_id for m in models}
+        sampled_models = sample_selection(model_ids, 3, 42)
+        tests_by_model = {m.unique_id: t.unique_id for m, t in zip(models, tests)}
+
+        selected = NodeSelector(graph, manifest, selectors=cfg).get_selected(
+            cfg["three"]["definition"]
+        )
+
+        # only the sampled models are directly selected
+        assert selected & model_ids == sampled_models
+        # every sampled model gets its attached test (eager indirect selection)
+        for model_id in sampled_models:
+            assert tests_by_model[model_id] in selected
+        # tests of un-sampled models are not pulled in by the sampling step
+        for model_id in model_ids - sampled_models:
+            assert tests_by_model[model_id] not in selected
+            assert model_id not in selected
+
+    def test_sample_empty_indirect_selection_drops_tests(self):
+        cfg = _sample_config([_sample_selector("three", 3, 42, indirect_selection="empty")])
+        models, tests, _, manifest, graph = _build_sample_project()
+
+        selected = NodeSelector(graph, manifest, selectors=cfg).get_selected(
+            cfg["three"]["definition"]
+        )
+
+        assert selected == sample_selection({m.unique_id for m in models}, 3, 42)
+        assert not (selected & {t.unique_id for t in tests})
+
+    def test_sample_cautious_selection_with_multi_parent_test(self):
+        cfg = _sample_config(
+            [
+                _sample_selector("one", 1, 42, indirect_selection="cautious"),
+                _sample_selector("all", 100, 42, indirect_selection="cautious"),
+            ]
+        )
+        models, _, multi_tests, manifest, graph = _build_sample_project(
+            n_models=4, n_multi_parent_tests=1
+        )
+        multi_test = multi_tests[0]
+        selector = NodeSelector(graph, manifest, selectors=cfg)
+
+        # the single sampled model is one of the test's parents, but the test
+        # has an un-sampled parent, so cautious selection keeps it indirect
+        one = selector.get_selected(cfg["one"]["definition"])
+        assert len(one & {m.unique_id for m in models}) == 1
+        assert multi_test.unique_id not in one
+
+        # once every parent is sampled, the cautious rule selects the test
+        all_selected = selector.get_selected(cfg["all"]["definition"])
+        assert multi_test.unique_id in all_selected
+
+    def test_sample_participates_in_union_intersection_and_exclusion(self):
+        cfg = _sample_config(
+            [
+                _sample_selector("three", 3, 42, indirect_selection="empty"),
+                _sample_selector("all", 100, 42),
+                {
+                    "name": "union_sample",
+                    "definition": {
+                        "union": [
+                            {
+                                "sample": {
+                                    "definition": "tag:nightly",
+                                    "count": 3,
+                                    "seed": 42,
+                                    "indirect_selection": "empty",
+                                }
+                            },
+                            "fqn:model_2",
+                        ]
+                    },
+                },
+                {
+                    "name": "intersection_sample",
+                    "definition": {
+                        "intersection": [
+                            {"sample": {"definition": "tag:nightly", "count": 100, "seed": 42}},
+                            "fqn:model_2",
+                        ]
+                    },
+                },
+                {
+                    "name": "excluded_sample",
+                    "definition": {
+                        "union": [
+                            {"sample": {"definition": "tag:nightly", "count": 3, "seed": 42}},
+                            {"exclude": ["fqn:model_0"]},
+                        ]
+                    },
+                },
+            ]
+        )
+        models, tests, _, manifest, graph = _build_sample_project()
+        model_ids = {m.unique_id for m in models}
+        tests_by_model = {m.unique_id: t.unique_id for m, t in zip(models, tests)}
+        selector = NodeSelector(graph, manifest, selectors=cfg)
+
+        sampled_three = sample_selection(model_ids, 3, 42)
+
+        # union: the sample plus a node outside of it
+        union_selected = selector.get_selected(cfg["union_sample"]["definition"])
+        assert union_selected & model_ids == sampled_three | {"model.pkg.model_2"}
+
+        # intersection: the full sample keeps only the intersected node
+        # (plus its eagerly-attached test)
+        intersection_selected = selector.get_selected(cfg["intersection_sample"]["definition"])
+        assert intersection_selected == {
+            "model.pkg.model_2",
+            tests_by_model["model.pkg.model_2"],
+        }
+
+        # exclusion removes an explicitly excluded sampled node
+        excluded_selected = selector.get_selected(cfg["excluded_sample"]["definition"])
+        assert "model.pkg.model_0" not in excluded_selected
+        assert excluded_selected & model_ids == sampled_three - {"model.pkg.model_0"}
+
+    def test_sample_wraps_a_named_selector(self):
+        cfg = _sample_config(
+            [
+                _sample_selector("three", 3, 42, indirect_selection="empty"),
+                _sample_selector(
+                    "wrapped",
+                    2,
+                    7,
+                    definition="selector:three",
+                    indirect_selection="empty",
+                ),
+            ]
+        )
+        _, _, _, manifest, graph = _build_sample_project()
+        selector = NodeSelector(graph, manifest, selectors=cfg)
+
+        base = selector.get_selected(cfg["three"]["definition"])
+        wrapped = selector.get_selected(cfg["wrapped"]["definition"])
+
+        assert wrapped == sample_selection(base, 2, 7)
+        assert wrapped <= base
+
+        # and the sampled named selector is usable through the selector: method
+        via_method = selector.get_selected(SelectionCriteria.from_single_spec("selector:three"))
+        assert via_method == base

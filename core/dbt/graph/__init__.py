@@ -6,6 +6,8 @@ from .selector_spec import (  # noqa: F401
     SelectionCriteria,
     SelectionDifference,
     SelectionIntersection,
+    SelectionSample,
     SelectionSpec,
     SelectionUnion,
+    sample_selection,
 )

@@ -1,4 +1,5 @@
 import os
+import random
 import re
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
@@ -7,7 +8,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Un
 from dbt.exceptions import InvalidSelectorError
 from dbt.flags import get_flags
 from dbt_common.dataclass_schema import StrEnum, dbtClassMixin
-from dbt_common.exceptions import DbtRuntimeError
+from dbt_common.exceptions import DbtInternalError, DbtRuntimeError, DbtValidationError
 
 from .graph import UniqueId
 from .selector_methods import MethodName
@@ -58,6 +59,7 @@ SelectionSpec = Union[
     "SelectionIntersection",
     "SelectionDifference",
     "SelectionUnion",
+    "SelectionSample",
 ]
 
 
@@ -220,3 +222,102 @@ class SelectionUnion(BaseSelectionGroup):
         selections: List[Set[UniqueId]],
     ) -> Set[UniqueId]:
         return set.union(*selections)
+
+
+def validate_sample_count(value: Any) -> int:
+    """Validate the ``count`` of a sample selector. Only non-negative integers
+    are accepted (booleans are rejected even though they are integers in
+    Python)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DbtValidationError(
+            f"The 'count' of a sample selector must be an integer, got "
+            f"{value!r} of type {type(value).__name__}"
+        )
+    if value < 0:
+        raise DbtValidationError(
+            f"The 'count' of a sample selector must be a non-negative integer, got {value}"
+        )
+    return value
+
+
+def validate_sample_seed(value: Any) -> int:
+    """Validate the ``seed`` of a sample selector. The seed is required and
+    must be an integer so that sampling is reproducible across processes."""
+    if value is None:
+        raise DbtValidationError(
+            "A sample selector requires an explicit integer 'seed' so that "
+            "sampling is reproducible"
+        )
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DbtValidationError(
+            f"The 'seed' of a sample selector must be an integer, got "
+            f"{value!r} of type {type(value).__name__}"
+        )
+    return value
+
+
+def sample_selection(
+    nodes: Iterable[UniqueId],
+    count: int,
+    seed: int,
+) -> Set[UniqueId]:
+    """Deterministically pick ``count`` distinct nodes from ``nodes``.
+
+    The candidate unique IDs are deduplicated and sorted before sampling, so
+    the result depends only on the candidate set, ``count`` and ``seed`` --
+    never on the iteration order of manifest dictionaries or set hashing. The
+    same inputs always produce the same output, including in different
+    processes.
+
+    - ``count`` of 0 returns an empty set
+    - ``count`` greater than or equal to the number of candidates returns all
+      of them
+    """
+    candidates = sorted(set(nodes))
+    if count == 0 or not candidates:
+        return set()
+    if count >= len(candidates):
+        return set(candidates)
+    rng = random.Random(seed)
+    return set(rng.sample(candidates, count))
+
+
+class SelectionSample(BaseSelectionGroup):
+    """Reproducibly sample a fixed number of distinct nodes from the directly
+    selected nodes of a single wrapped selection definition.
+
+    The wrapped definition is available as the single component of this
+    group. Indirect test expansion is applied to the sampled nodes (not to
+    the wrapped definition's full selection) using this spec's
+    ``indirect_selection`` setting, so nodes that were not sampled are not
+    selected merely because they were part of the wrapped definition.
+    """
+
+    def __init__(
+        self,
+        components: Iterable[SelectionSpec],
+        count: int,
+        seed: int,
+        indirect_selection: IndirectSelection = IndirectSelection.Eager,
+        expect_exists: bool = False,
+        raw: Any = None,
+    ) -> None:
+        super().__init__(
+            components=components,
+            indirect_selection=indirect_selection,
+            expect_exists=expect_exists,
+            raw=raw,
+        )
+        self.count = count
+        self.seed = seed
+
+    def combine_selections(
+        self,
+        selections: List[Set[UniqueId]],
+    ) -> Set[UniqueId]:
+        # A sample wraps a single definition and is resolved directly by the
+        # NodeSelector; the generic group combination path never applies.
+        raise DbtInternalError("SelectionSample is resolved directly by the NodeSelector")
+
+    def sample(self, nodes: Iterable[UniqueId]) -> Set[UniqueId]:
+        return sample_selection(nodes, self.count, self.seed)

@@ -14,8 +14,11 @@ from .selector_spec import (
     SelectionCriteria,
     SelectionDifference,
     SelectionIntersection,
+    SelectionSample,
     SelectionSpec,
     SelectionUnion,
+    validate_sample_count,
+    validate_sample_seed,
 )
 
 INTERSECTION_DELIMITER = ","
@@ -195,6 +198,58 @@ def parse_dict_definition(definition: Dict[str, Any], result={}) -> SelectionSpe
         return SelectionDifference(components=[base, diff_arg])
 
 
+def parse_sample_definition(definition: Dict[str, Any], result={}) -> SelectionSample:
+    """Parse a ``sample`` wrapper, e.g.::
+
+    sample:
+      definition: <any selector definition>
+      count: 5
+      seed: 42
+      indirect_selection: eager  # optional
+    """
+    sample_definition = definition.get("sample")
+    if not isinstance(sample_definition, dict):
+        raise DbtValidationError(
+            'A "sample" selector definition must be a mapping containing '
+            '"definition", "count", and "seed" keys.'
+        )
+
+    allowed_keys = {"definition", "count", "seed", "indirect_selection"}
+    unexpected_keys = set(sample_definition) - allowed_keys
+    if unexpected_keys:
+        raise DbtValidationError(
+            f'Unexpected key(s) {sorted(unexpected_keys)} in "sample" selector '
+            f"definition. Allowed keys are: {sorted(allowed_keys)}."
+        )
+
+    if "definition" not in sample_definition:
+        raise DbtValidationError(
+            'A "sample" selector definition requires a nested "definition" '
+            "naming the selection to sample from."
+        )
+    if "count" not in sample_definition:
+        raise DbtValidationError('A "sample" selector definition requires an integer "count".')
+    if "seed" not in sample_definition:
+        raise DbtValidationError(
+            'A "sample" selector definition requires an explicit integer "seed".'
+        )
+
+    count = validate_sample_count(sample_definition["count"])
+    seed = validate_sample_seed(sample_definition["seed"])
+    wrapped = parse_from_definition(sample_definition["definition"], result=result)
+    indirect_selection = IndirectSelection(
+        sample_definition.get("indirect_selection", get_flags().INDIRECT_SELECTION)
+    )
+
+    return SelectionSample(
+        components=[wrapped],
+        count=count,
+        seed=seed,
+        indirect_selection=indirect_selection,
+        raw=definition,
+    )
+
+
 def parse_from_definition(
     definition: RawDefinition,
     rootlevel=False,
@@ -218,11 +273,13 @@ def parse_from_definition(
         return parse_union_definition(definition, result=result)
     elif "intersection" in definition:
         return parse_intersection_definition(definition, result=result)
+    elif "sample" in definition:
+        return parse_sample_definition(definition, result=result)
     elif isinstance(definition, dict):
         return parse_dict_definition(definition, result=result)
     else:
         raise DbtValidationError(
-            f"Expected to find union, intersection, str or dict, instead "
+            f"Expected to find union, intersection, sample, str or dict, instead "
             f"found {type(definition)}: {definition}"
         )
 

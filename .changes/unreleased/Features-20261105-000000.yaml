@@ -1,0 +1,6 @@
+kind: Features
+body: Add reproducible node sampling to named selectors via a `sample` definition
+  that wraps an existing selection with an integer `count` and explicit `seed`
+custom:
+  Author: dbt-labs
+  Issue: "0"

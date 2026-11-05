@@ -1,10 +1,18 @@
 import textwrap
 import unittest
 
+import pytest
 import yaml
 
 import dbt.exceptions
 from dbt.config.selectors import SelectorConfig, SelectorDict, selector_config_from_data
+from dbt.graph import (
+    SelectionDifference,
+    SelectionIntersection,
+    SelectionSample,
+    SelectionUnion,
+)
+from dbt.graph.selector_spec import IndirectSelection, SelectionCriteria
 
 
 def get_selector_dict(txt: str) -> dict:
@@ -311,3 +319,181 @@ class SelectorUnitTest(unittest.TestCase):
         expected = {"method": "fqn", "value": "my_model", "children": True, "children_depth": "2"}
         definition = sel_dict["my_model_children_selector"]["definition"]
         self.assertEqual(expected, definition)
+
+
+def _sample_data(definition):
+    return {"selectors": [{"name": "sampled", "definition": definition}]}
+
+
+class TestSampleSelectorParsing(unittest.TestCase):
+    def test_sample_parses_to_selection_sample(self):
+        dct = _sample_data(
+            {
+                "sample": {
+                    "definition": "tag:nightly",
+                    "count": 5,
+                    "seed": 42,
+                }
+            }
+        )
+        selectors = selector_config_from_data(dct)
+        sample = selectors["sampled"]["definition"]
+
+        assert isinstance(sample, SelectionSample)
+        assert sample.count == 5
+        assert sample.seed == 42
+        assert sample.components[0] == SelectionCriteria.from_single_spec("tag:nightly")
+
+    def test_sample_wraps_union_and_sets_indirect_selection(self):
+        dct = _sample_data(
+            {
+                "sample": {
+                    "definition": {
+                        "union": ["tag:nightly", "tag:hourly"],
+                    },
+                    "count": 1,
+                    "seed": 7,
+                    "indirect_selection": "cautious",
+                }
+            }
+        )
+        selectors = selector_config_from_data(dct)
+        sample = selectors["sampled"]["definition"]
+
+        assert isinstance(sample, SelectionSample)
+        assert isinstance(sample.components[0], SelectionUnion)
+        assert sample.indirect_selection == IndirectSelection.Cautious
+
+    def test_sample_can_combine_with_intersection_and_exclude(self):
+        dct = _sample_data(
+            {
+                "union": [
+                    {
+                        "sample": {
+                            "definition": "tag:nightly",
+                            "count": 3,
+                            "seed": 42,
+                        }
+                    },
+                    {"exclude": ["fqn:model_one"]},
+                ]
+            }
+        )
+        selectors = selector_config_from_data(dct)
+        definition = selectors["sampled"]["definition"]
+
+        assert isinstance(definition, SelectionDifference)
+        assert isinstance(definition.components[0], SelectionUnion)
+        assert isinstance(definition.components[0].components[0], SelectionSample)
+        assert isinstance(definition.components[1], SelectionCriteria)
+
+    def test_sample_inside_intersection(self):
+        dct = _sample_data(
+            {
+                "intersection": [
+                    {
+                        "sample": {
+                            "definition": "tag:nightly",
+                            "count": 3,
+                            "seed": 42,
+                        }
+                    },
+                    "resource_type:model",
+                ]
+            }
+        )
+        selectors = selector_config_from_data(dct)
+        definition = selectors["sampled"]["definition"]
+
+        assert isinstance(definition, SelectionIntersection)
+        assert isinstance(definition.components[0], SelectionSample)
+        assert isinstance(definition.components[1], SelectionCriteria)
+
+    def test_sample_value_must_be_a_mapping(self):
+        dct = _sample_data({"sample": "tag:nightly"})
+        with self.assertRaisesRegex(dbt.exceptions.DbtSelectorsError, "must be a mapping"):
+            selector_config_from_data(dct)
+
+    def test_selector_dict_normalizes_sample_definition(self):
+        dct = get_selector_dict(
+            """\
+            selectors:
+              - name: sampled
+                definition:
+                  sample:
+                    definition: tag:nightly
+                    count: 3
+                    seed: 42
+            """
+        )
+        sel_dict = SelectorDict.parse_from_selectors_list(dct["selectors"])
+        definition = sel_dict["sampled"]["definition"]
+
+        self.assertEqual(
+            definition,
+            {
+                "sample": {
+                    "definition": {"method": "tag", "value": "nightly"},
+                    "count": 3,
+                    "seed": 42,
+                }
+            },
+        )
+
+    def test_selector_dict_normalizes_nested_sample_definition(self):
+        dct = get_selector_dict(
+            """\
+            selectors:
+              - name: sampled
+                definition:
+                  union:
+                    - sample:
+                        definition:
+                          union:
+                            - tag:nightly
+                            - method: tag
+                              value: hourly
+                        count: 2
+                        seed: 1
+            """
+        )
+        sel_dict = SelectorDict.parse_from_selectors_list(dct["selectors"])
+        definition = sel_dict["sampled"]["definition"]
+
+        sample = definition["union"][0]["sample"]
+        assert sample["count"] == 2
+        assert sample["seed"] == 1
+        assert sample["definition"]["union"] == [
+            {"method": "tag", "value": "nightly"},
+            {"method": "tag", "value": "hourly"},
+        ]
+
+
+@pytest.mark.parametrize(
+    "sample_definition,error_fragment",
+    [
+        ({"definition": "tag:nightly", "count": -1, "seed": 42}, "non-negative"),
+        ({"definition": "tag:nightly", "count": 1.5, "seed": 42}, "must be an integer"),
+        ({"definition": "tag:nightly", "count": 5.0, "seed": 42}, "must be an integer"),
+        ({"definition": "tag:nightly", "count": "3", "seed": 42}, "must be an integer"),
+        ({"definition": "tag:nightly", "count": True, "seed": 42}, "must be an integer"),
+        ({"definition": "tag:nightly", "count": 3, "seed": "abc"}, "must be an integer"),
+        ({"definition": "tag:nightly", "count": 3, "seed": 1.5}, "must be an integer"),
+        ({"definition": "tag:nightly", "count": 3}, "seed"),
+        ({"definition": "tag:nightly", "seed": 42}, "count"),
+        ({"count": 3, "seed": 42}, "definition"),
+        (
+            {
+                "definition": "tag:nightly",
+                "count": 3,
+                "seed": 42,
+                "unexpected": 1,
+            },
+            "Unexpected key",
+        ),
+    ],
+)
+def test_invalid_sample_definitions(sample_definition, error_fragment):
+    dct = _sample_data({"sample": sample_definition})
+    with pytest.raises(dbt.exceptions.DbtSelectorsError, match=error_fragment):
+        selector_config_from_data(dct)

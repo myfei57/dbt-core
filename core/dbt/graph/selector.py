@@ -12,7 +12,13 @@ from dbt_common.events.functions import fire_event
 from .graph import Graph, UniqueId
 from .queue import GraphQueue
 from .selector_methods import MethodManager, MethodName
-from .selector_spec import IndirectSelection, SelectionCriteria, SelectionSpec
+from .selector_spec import (
+    IndirectSelection,
+    SelectionCriteria,
+    SelectionSample,
+    SelectionSpec,
+    sample_selection,
+)
 
 
 def get_package_names(nodes):
@@ -81,7 +87,9 @@ class NodeSelector(MethodManager):
         return set(method.search(included_nodes, spec.value))
 
     def get_nodes_from_criteria(
-        self, spec: SelectionCriteria
+        self,
+        spec: SelectionCriteria,
+        indirect_selection: Optional[IndirectSelection] = None,
     ) -> Tuple[Set[UniqueId], Set[UniqueId]]:
         """Get all nodes specified by the single selection criteria.
 
@@ -89,6 +97,7 @@ class NodeSelector(MethodManager):
         - find their specified relatives
         - perform any selector-specific expansion
         """
+        indirect_selection = indirect_selection or spec.indirect_selection
 
         nodes = self.graph.nodes()
         try:
@@ -106,7 +115,7 @@ class NodeSelector(MethodManager):
         selected = collected | neighbors
 
         # if --indirect-selection EMPTY, do not expand to adjacent tests
-        if spec.indirect_selection == IndirectSelection.Empty:
+        if indirect_selection == IndirectSelection.Empty:
             return selected, set()
         # The `selector` method calls get_selected() internally, which already
         # runs the full selection pipeline including expand_selection() and any
@@ -117,9 +126,41 @@ class NodeSelector(MethodManager):
             return selected, set()
         else:
             direct_nodes, indirect_nodes = self.expand_selection(
-                selected=selected, indirect_selection=spec.indirect_selection
+                selected=selected, indirect_selection=indirect_selection
             )
             return direct_nodes, indirect_nodes
+
+    def get_nodes_from_sample(
+        self, spec: SelectionSample, warn_on_no_nodes: bool = True
+    ) -> Tuple[Set[UniqueId], Set[UniqueId]]:
+        """Resolve a sample selection.
+
+        - First collect the directly selected nodes of the wrapped
+          definition. The wrapped definition is evaluated with EMPTY indirect
+          selection, so its attached tests are not expanded into the
+          candidate set (sampling happens on the definition's own selection).
+        - Reproducibly pick ``spec.count`` distinct candidates using
+          ``spec.seed``.
+        - Finally, apply this sample's configured indirect-selection rule to
+          the sampled nodes only, so un-sampled nodes and their tests are not
+          selected merely because they belonged to the wrapped definition.
+        """
+        wrapped_spec = spec.components[0]
+        wrapped_direct, _ = self.select_nodes_recursively(
+            spec=wrapped_spec,
+            warn_on_no_nodes=warn_on_no_nodes,
+            indirect_selection_override=IndirectSelection.Empty,
+        )
+
+        sampled = sample_selection(wrapped_direct, spec.count, spec.seed)
+
+        if spec.indirect_selection == IndirectSelection.Empty:
+            return sampled, set()
+
+        direct_nodes, indirect_nodes = self.expand_selection(
+            selected=sampled, indirect_selection=spec.indirect_selection
+        )
+        return direct_nodes, indirect_nodes
 
     def collect_specified_neighbors(
         self, spec: SelectionCriteria, selected: Set[UniqueId]
@@ -143,17 +184,35 @@ class NodeSelector(MethodManager):
         return additional
 
     def select_nodes_recursively(
-        self, spec: SelectionSpec, warn_on_no_nodes: bool = True
+        self,
+        spec: SelectionSpec,
+        warn_on_no_nodes: bool = True,
+        indirect_selection_override: Optional[IndirectSelection] = None,
     ) -> Tuple[Set[UniqueId], Set[UniqueId]]:
-        """If the spec is a composite spec (a union, difference, or intersection),
-        recurse into its selections and combine them. If the spec is a concrete
-        selection criteria, resolve that using the given graph.
+        """If the spec is a composite spec (a union, difference, intersection,
+        or sample), recurse into its selections and combine them. If the spec
+        is a concrete selection criteria, resolve that using the given graph.
+
+        ``indirect_selection_override`` forces the indirect-selection mode of
+        every criteria and group below this point. It is used to collect the
+        directly selected nodes of a definition (without test expansion)
+        before sampling.
         """
         if isinstance(spec, SelectionCriteria):
-            direct_nodes, indirect_nodes = self.get_nodes_from_criteria(spec)
+            direct_nodes, indirect_nodes = self.get_nodes_from_criteria(
+                spec, indirect_selection=indirect_selection_override
+            )
+        elif isinstance(spec, SelectionSample):
+            direct_nodes, indirect_nodes = self.get_nodes_from_sample(
+                spec, warn_on_no_nodes=warn_on_no_nodes
+            )
         else:
             bundles = [
-                self.select_nodes_recursively(spec=component, warn_on_no_nodes=warn_on_no_nodes)
+                self.select_nodes_recursively(
+                    spec=component,
+                    warn_on_no_nodes=warn_on_no_nodes,
+                    indirect_selection_override=indirect_selection_override,
+                )
                 for component in spec.components
             ]
 
@@ -168,7 +227,9 @@ class NodeSelector(MethodManager):
             indirect_nodes = spec.combined(indirect_sets)
 
             direct_nodes = self.incorporate_indirect_nodes(
-                initial_direct, indirect_nodes, spec.indirect_selection
+                initial_direct,
+                indirect_nodes,
+                indirect_selection_override or spec.indirect_selection,
             )
 
             if spec.expect_exists and len(direct_nodes) == 0 and warn_on_no_nodes:

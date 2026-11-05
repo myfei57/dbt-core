@@ -175,6 +175,16 @@ class SelectorDict:
         return new_dict
 
     @classmethod
+    def parse_sample_definition(cls, definition, selector_dict={}):
+        # Normalize the wrapped definition while preserving the sample's
+        # count, seed, and indirect_selection settings.
+        sample_definition = definition["sample"]
+        wrapped = cls.parse_from_definition(
+            sample_definition["definition"], selector_dict=selector_dict
+        )
+        return {"sample": {**sample_definition, "definition": wrapped}}
+
+    @classmethod
     def parse_from_definition(cls, definition, selector_dict={}):
         if isinstance(definition, str):
             definition = SelectionCriteria.dict_from_single_spec(definition)
@@ -184,6 +194,8 @@ class SelectorDict:
             definition = cls.parse_a_definition(
                 "intersection", definition, selector_dict=selector_dict
             )
+        elif "sample" in definition:
+            definition = cls.parse_sample_definition(definition, selector_dict=selector_dict)
         elif isinstance(definition, dict):
             definition = cls.parse_dict_definition(definition, selector_dict=selector_dict)
         return definition
