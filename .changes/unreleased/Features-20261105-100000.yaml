@@ -1,0 +1,9 @@
+kind: Features
+body: 'Add a CSV output format to `dbt ls` (`--output csv`) with a header row,
+    user-ordered `--output-keys` columns (including nested dot-notation keys),
+    empty cells for missing/null fields, and compact JSON cells for lists and
+    objects'
+time: 2026-11-05T10:00:00.000000Z
+custom:
+    Author: myfei57
+    Issue: ""

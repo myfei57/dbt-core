@@ -1,5 +1,7 @@
+import csv
+import io
 import json
-from typing import Iterator, List, Optional
+from typing import Any, Iterator, List, Optional
 
 from dbt.artifacts.resources import Catalog
 from dbt.cli.flags import Flags
@@ -57,6 +59,15 @@ class ListTask(GraphRunnableTask):
             "original_file_path",
             "unique_id",
         )
+    )
+    # Columns included in `dbt ls --output csv` when the user does not
+    # customize them with --output-keys. The order is the column order.
+    CSV_DEFAULT_KEYS = (
+        "unique_id",
+        "resource_type",
+        "package_name",
+        "name",
+        "original_file_path",
     )
 
     def __init__(
@@ -155,16 +166,22 @@ class ListTask(GraphRunnableTask):
                 return None
         return current
 
+    def _get_node_dict(self, node):
+        """Serialize a selected node for list output.
+
+        `direct_parents` is stripped from ModelNode serialization (see
+        ModelNode.__post_serialize__) so it doesn't leak into manifest.json.
+        Reinstate it here so lineage consumers can read nearest-public-ancestor
+        edges from `dbt ls --output json` and `dbt ls --output csv`.
+        """
+        node_dict = node.to_dict(omit_none=False)
+        if isinstance(node, ModelNode):
+            node_dict["direct_parents"] = list(node.direct_parents)
+        return node_dict
+
     def generate_json(self):
         for node in self._iterate_selected_nodes():
-            node_dict = node.to_dict(omit_none=False)
-
-            # direct_parents is stripped from ModelNode serialization (see
-            # ModelNode.__post_serialize__) so it doesn't leak into
-            # manifest.json. Reinstate it here so lineage consumers can read
-            # nearest-public-ancestor edges from `dbt ls --output=json`.
-            if isinstance(node, ModelNode):
-                node_dict["direct_parents"] = list(node.direct_parents)
+            node_dict = self._get_node_dict(node)
 
             if self.args.output_keys:
                 # Handle both nested and regular keys
@@ -185,6 +202,59 @@ class ListTask(GraphRunnableTask):
 
             yield json.dumps(result, cls=JSONEncoder)
 
+    @staticmethod
+    def _csv_row(values) -> str:
+        """Serialize one CSV record (the header or a data row).
+
+        The line terminator is left to the output layer. The csv module's
+        default QUOTE_MINIMAL dialect quotes fields containing the delimiter,
+        the quote character, or line breaks, and doubles embedded quotes.
+        """
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(values)
+        return buffer.getvalue().rstrip("\n")
+
+    @staticmethod
+    def _csv_format_value(value: Any) -> str:
+        """Serialize a single node property into a CSV cell."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple, dict)):
+            # Keep lists and objects inside a single cell as compact JSON.
+            return json.dumps(
+                value,
+                cls=JSONEncoder,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        return str(value)
+
+    def generate_csv(self) -> Iterator[str]:
+        # Column order follows the user-given --output-keys order. Nested keys
+        # use the same dot notation as JSON output (e.g. "config.materialized")
+        # and are emitted verbatim as the column header.
+        keys = tuple(self.args.output_keys) if self.args.output_keys else self.CSV_DEFAULT_KEYS
+
+        # Emit the header even when nothing is selected so the output is always
+        # valid CSV with a stable column schema.
+        yield self._csv_row(keys)
+
+        for node in self._iterate_selected_nodes():
+            node_dict = self._get_node_dict(node)
+            row = []
+            for key in keys:
+                if "." in key:
+                    # Missing nested fields resolve to None and become empty
+                    # cells, just like null values.
+                    value = self._get_nested_value(node_dict, key)
+                else:
+                    value = node_dict.get(key)
+                row.append(self._csv_format_value(value))
+            yield self._csv_row(row)
+
     def generate_paths(self) -> Iterator[str]:
         for node in self._iterate_selected_nodes():
             yield node.original_file_path
@@ -203,6 +273,8 @@ class ListTask(GraphRunnableTask):
                 generator = self.generate_json
             elif output == "path":
                 generator = self.generate_paths
+            elif output == "csv":
+                generator = self.generate_csv
             else:
                 raise DbtInternalError("Invalid output {}".format(output))
 

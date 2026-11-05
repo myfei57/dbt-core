@@ -1,6 +1,8 @@
+import csv
+import io
 import json
 from argparse import Namespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from dbt.flags import get_flags, set_from_args
 from dbt.task.list import ListTask
@@ -295,3 +297,222 @@ class TestDirectParentsInLsOutput:
         model.direct_parents = ["model.test.upstream"]
 
         assert "direct_parents" not in model.to_dict(omit_none=False)
+
+
+def parse_csv(rows):
+    """Parse the line-oriented output of generate_csv back into records."""
+    return list(csv.reader(io.StringIO("\n".join(rows))))
+
+
+class TestCsvFormatValue:
+    """Unit tests for the _csv_format_value helper"""
+
+    def test_none_is_empty_cell(self):
+        assert ListTask._csv_format_value(None) == ""
+
+    def test_string_is_unwrapped(self):
+        assert ListTask._csv_format_value("my_model") == "my_model"
+
+    def test_empty_string_stays_empty(self):
+        assert ListTask._csv_format_value("") == ""
+
+    def test_list_is_compact_json(self):
+        assert ListTask._csv_format_value(["a", "b"]) == '["a","b"]'
+
+    def test_empty_list_is_compact_json(self):
+        assert ListTask._csv_format_value([]) == "[]"
+
+    def test_dict_is_compact_json(self):
+        assert ListTask._csv_format_value({"a": 1}) == '{"a":1}'
+
+    def test_empty_dict_is_compact_json(self):
+        assert ListTask._csv_format_value({}) == "{}"
+
+    def test_tuple_serializes_as_json_array(self):
+        assert ListTask._csv_format_value(("a", 1)) == '["a",1]'
+
+    def test_nested_containers_are_compact_json(self):
+        assert ListTask._csv_format_value({"tags": ["a", "b"]}) == '{"tags":["a","b"]}'
+
+    def test_scalars_stringify(self):
+        assert ListTask._csv_format_value(1) == "1"
+        assert ListTask._csv_format_value(1.5) == "1.5"
+        assert ListTask._csv_format_value(True) == "True"
+        assert ListTask._csv_format_value(False) == "False"
+
+
+class TestCsvRow:
+    """Unit tests for the _csv_row helper"""
+
+    def test_simple_row(self):
+        assert ListTask._csv_row(["a", "b", "c"]) == "a,b,c"
+
+    def test_comma_is_quoted(self):
+        assert ListTask._csv_row(["a,b", "c"]) == '"a,b",c'
+
+    def test_quote_is_doubled_and_quoted(self):
+        assert ListTask._csv_row(['a "quoted" value', "c"]) == '"a ""quoted"" value",c'
+
+    def test_newline_is_quoted(self):
+        row = ListTask._csv_row(["line1\nline2", "c"])
+        # The embedded newline stays inside the quoted field so it remains one
+        # CSV record, and no terminator is appended.
+        assert row == '"line1\nline2",c'
+
+    def test_carriage_return_is_quoted(self):
+        assert ListTask._csv_row(["a\rb", "c"]) == '"a\rb",c'
+
+    def test_empty_cells(self):
+        assert ListTask._csv_row(["", "", "c"]) == ",,c"
+
+
+class TestGenerateCsv:
+    """Unit tests for the generate_csv method"""
+
+    def setup_method(self):
+        set_from_args(Namespace(models=None, output_keys=None), {})
+        self.task = ListTask(get_flags(), None, None)
+
+    def create_mock_node(self, name="test_model", **overrides):
+        node = Mock()
+        node_dict = {
+            "name": name,
+            "resource_type": "model",
+            "package_name": "test",
+            "unique_id": f"model.test.{name}",
+            "original_file_path": f"models/{name}.sql",
+            "alias": None,
+            "tags": ["tag_a", "tag_b"],
+            "config": {
+                "materialized": "table",
+                "enabled": True,
+                "meta": {"owner": "data-team"},
+            },
+        }
+        node_dict.update(overrides)
+        node.to_dict.return_value = node_dict
+        return node
+
+    def generate(self, nodes, output_keys=()):
+        with patch.object(self.task, "args") as mock_args:
+            mock_args.output_keys = output_keys
+            with patch.object(
+                self.task, "_iterate_selected_nodes", return_value=nodes
+            ) as mock_iterate:
+                rows = list(self.task.generate_csv())
+        return rows, mock_iterate
+
+    def test_default_header_and_row(self):
+        rows, _ = self.generate([self.create_mock_node()])
+        assert rows[0] == "unique_id,resource_type,package_name,name,original_file_path"
+        assert rows[1] == "model.test.test_model,model,test,test_model,models/test_model.sql"
+        assert len(rows) == 2
+
+    def test_header_is_always_first(self):
+        rows, _ = self.generate([self.create_mock_node(), self.create_mock_node("other")])
+        assert rows[0] == "unique_id,resource_type,package_name,name,original_file_path"
+        assert len(rows) == 3
+
+    def test_default_header_with_empty_selection(self):
+        rows, _ = self.generate([])
+        assert rows == ["unique_id,resource_type,package_name,name,original_file_path"]
+
+    def test_custom_header_with_empty_selection(self):
+        rows, _ = self.generate([], output_keys=["name", "config.materialized"])
+        assert rows == ["name,config.materialized"]
+
+    def test_custom_keys_preserve_given_order(self):
+        node = self.create_mock_node()
+        rows, _ = self.generate(
+            [node],
+            output_keys=["name", "unique_id", "package_name"],
+        )
+        records = parse_csv(rows)
+        assert records == [
+            ["name", "unique_id", "package_name"],
+            ["test_model", "model.test.test_model", "test"],
+        ]
+
+    def test_nested_keys_use_dot_notation_as_header(self):
+        node = self.create_mock_node()
+        rows, _ = self.generate(
+            [node],
+            output_keys=["name", "config.materialized", "config.meta.owner"],
+        )
+        records = parse_csv(rows)
+        assert records == [
+            ["name", "config.materialized", "config.meta.owner"],
+            ["test_model", "table", "data-team"],
+        ]
+
+    def test_missing_and_none_fields_are_empty_cells(self):
+        node = self.create_mock_node()
+        rows, _ = self.generate(
+            [node],
+            output_keys=[
+                "name",
+                "does_not_exist",
+                "config.does_not_exist",
+                "alias",
+                "unique_id",
+            ],
+        )
+        records = parse_csv(rows)
+        assert records == [
+            [
+                "name",
+                "does_not_exist",
+                "config.does_not_exist",
+                "alias",
+                "unique_id",
+            ],
+            ["test_model", "", "", "", "model.test.test_model"],
+        ]
+
+    def test_list_and_dict_values_are_compact_json(self):
+        node = self.create_mock_node()
+        rows, _ = self.generate(
+            [node],
+            output_keys=["tags", "config.meta", "config"],
+        )
+        records = parse_csv(rows)
+        assert records[0] == ["tags", "config.meta", "config"]
+        assert json.loads(records[1][0]) == ["tag_a", "tag_b"]
+        assert json.loads(records[1][1]) == {"owner": "data-team"}
+        assert json.loads(records[1][2]) == {
+            "materialized": "table",
+            "enabled": True,
+            "meta": {"owner": "data-team"},
+        }
+
+    def test_empty_list_serializes_as_empty_json_array(self):
+        node = self.create_mock_node(tags=[])
+        rows, _ = self.generate([node], output_keys=["tags"])
+        records = parse_csv(rows)
+        assert records == [["tags"], ["[]"]]
+
+    def test_special_characters_are_escaped(self):
+        node = self.create_mock_node(name='a, "b"\nc')
+        rows, _ = self.generate([node], output_keys=["name"])
+        records = parse_csv(rows)
+        assert records == [["name"], ['a, "b"\nc']]
+
+    def test_bool_and_number_values_stringify(self):
+        node = self.create_mock_node()
+        rows, _ = self.generate([node], output_keys=["config.enabled", "resource_type"])
+        records = parse_csv(rows)
+        assert records == [["config.enabled", "resource_type"], ["True", "model"]]
+
+    def test_node_order_follows_selected_nodes(self):
+        first = self.create_mock_node("first")
+        second = self.create_mock_node("second")
+        rows, _ = self.generate([second, first], output_keys=["name"])
+        records = parse_csv(rows)
+        assert records == [["name"], ["second"], ["first"]]
+
+    def test_uses_same_node_selection(self):
+        # generate_csv must source nodes from _iterate_selected_nodes, so it
+        # keeps the existing selection and sorting rules.
+        nodes, mock_iterate = self.generate([self.create_mock_node()])
+        assert mock_iterate.called
+        assert len(nodes) == 2

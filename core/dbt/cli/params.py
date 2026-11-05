@@ -451,8 +451,11 @@ models = _create_option_and_track_env_var(*model_decls, **select_attrs)  # type:
 output = _create_option_and_track_env_var(
     "--output",
     envvar=None,
-    help="Specify the output format: either JSON or a newline-delimited list of selectors, paths, or names",
-    type=click.Choice(["json", "name", "path", "selector"], case_sensitive=False),
+    help=(
+        "Specify the output format: either JSON or CSV, or a newline-delimited "
+        "list of selectors, paths, or names"
+    ),
+    type=click.Choice(["json", "name", "path", "selector", "csv"], case_sensitive=False),
     default="selector",
 )
 
@@ -460,8 +463,8 @@ output_keys = _create_option_and_track_env_var(
     "--output-keys",
     envvar=None,
     help=(
-        "Space-delimited listing of node properties to include as custom keys for JSON output. "
-        "Supports nested keys using dot notation "
+        "Space-delimited listing of node properties to include as custom keys for "
+        "JSON or CSV output. Supports nested keys using dot notation "
         "(e.g. `--output json --output-keys name config.materialized resource_type`)"
     ),
     type=tuple,
