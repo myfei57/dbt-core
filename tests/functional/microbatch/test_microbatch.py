@@ -1399,3 +1399,56 @@ class TestMicrobatchBuildRetryUsesOriginalInvocationTime(BaseMicrobatchTest):
         # Should only have 3 batches (2020-01-01, 2020-01-02, 2020-01-03)
         assert len(batch_catcher.caught_events) == 3
         self.assert_row_count(project, "microbatch_model", 3)
+
+
+class TestMicrobatchRetryStatusFilter(BaseMicrobatchTest):
+    """--retry-statuses must never re-run successful batches of microbatch
+    models, and a microbatch model whose overall status is not selected is not
+    re-run at all (no batches either)."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "input_model.sql": input_model_sql,
+            "microbatch_model.sql": microbatch_model_failing_incremental_partition_sql,
+        }
+
+    def test_retry_status_filter_batches(self, project):
+        # 2 successful batches, 1 failed -> node status "partial success"
+        with patch_microbatch_end_time("2020-01-03 13:57:00"):
+            run_dbt(["run"], expect_pass=False)
+        self.assert_row_count(project, "microbatch_model", 2)
+
+        # Fix the model so the failed batch can succeed.
+        write_file(
+            microbatch_model_sql,
+            project.project_root,
+            "models",
+            "microbatch_model.sql",
+        )
+
+        # The model has status "partial success", not "error", so this filter
+        # matches nothing: no batches may execute and successful batches are
+        # left untouched.
+        batch_catcher = EventCatcher(event_to_catch=LogBatchResult)
+        results = run_dbt(["retry", "--retry-statuses", "error"], callbacks=[batch_catcher.catch])
+        assert len(results) == 0
+        assert len(batch_catcher.caught_events) == 0
+        self.assert_row_count(project, "microbatch_model", 2)
+
+        # The no-match outcome is clearly communicated (and stable across
+        # repeated filtered retries, since the previous run_results are kept).
+        _, console_output = run_dbt_and_capture(["retry", "--retry-statuses", "error"])
+        assert "matched the requested retry status(es): 'error'" in console_output
+        self.assert_row_count(project, "microbatch_model", 2)
+
+        # Selecting "partial success" retries only the previously failed batch;
+        # the two successful batches are carried forward (not re-run).
+        batch_catcher = EventCatcher(event_to_catch=LogBatchResult)
+        with patch_microbatch_end_time("2020-01-03 13:57:00"):
+            run_dbt(
+                ["retry", "--retry-statuses", "partial-success"],
+                callbacks=[batch_catcher.catch],
+            )
+        assert len(batch_catcher.caught_events) == 1
+        self.assert_row_count(project, "microbatch_model", 3)

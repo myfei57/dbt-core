@@ -1,0 +1,12 @@
+kind: Features
+body: >-
+  Added `--retry-statuses` (alias `--retry-status`) to `dbt retry`, allowing
+  retries to be scoped to a set of statuses from the previous run. The flag is
+  repeatable, accepts space-separated values, and treats duplicates as a set;
+  unknown statuses and non-retryable (successful) statuses are rejected before
+  execution. When no node matches the filter, dbt exits successfully without
+  running models or hooks, and microbatch models only re-attempt previously
+  failed batches of selected models.
+custom:
+  Author: trae-agent
+  Issue: "N/A"

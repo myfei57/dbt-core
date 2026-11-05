@@ -1,8 +1,9 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import pytz
 from click import Choice, Context, Parameter, ParamType
 
+from dbt.artifacts.schemas.results import NodeStatus
 from dbt.config.utils import (
     build_warn_error_options_v2,
     normalize_warn_error_options,
@@ -12,6 +13,18 @@ from dbt.event_time.sample_window import SampleWindow
 from dbt.events import ALL_EVENT_NAMES
 from dbt.exceptions import OptionNotYamlDictError, ValidationError
 from dbt_common.exceptions import DbtValidationError
+
+# Statuses that can be retried by `dbt retry` under some invocation configuration.
+# NodeStatus.Warn is only retryable when --warn-error is provided and is validated
+# later, in RetryTask.
+POTENTIALLY_RETRYABLE_NODE_STATUSES: Tuple[NodeStatus, ...] = (
+    NodeStatus.Error,
+    NodeStatus.Fail,
+    NodeStatus.Skipped,
+    NodeStatus.RuntimeErr,
+    NodeStatus.PartialSuccess,
+    NodeStatus.Warn,
+)
 
 
 class YAML(ParamType):
@@ -133,6 +146,44 @@ class ChoiceTuple(Choice):
             super().convert(value, param, ctx)
 
         return value
+
+
+class RetryStatusType(ChoiceTuple):
+    """Click type for the `--retry-statuses` option of `dbt retry`.
+
+    Every token must be the name of a node status (case-insensitive, with
+    underscores or hyphens accepted in place of spaces, e.g. "runtime_error"
+    for "runtime error"). Tokens are returned as ``NodeStatus`` members.
+    Statuses that are never retried (e.g. "success") are syntactically valid
+    here and are rejected later by ``RetryTask``, which knows which statuses
+    are retryable under the current invocation configuration (e.g. "warn" is
+    only retryable with --warn-error).
+    """
+
+    name = "RETRY_STATUS"
+
+    def __init__(self) -> None:
+        super().__init__(
+            choices=[status.value for status in POTENTIALLY_RETRYABLE_NODE_STATUSES],
+            case_sensitive=False,
+        )
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, str):
+            return self._convert_status(value, param, ctx)
+        return tuple(self._convert_status(item, param, ctx) for item in value)
+
+    def _convert_status(self, value, param, ctx) -> NodeStatus:
+        normalized = value.strip().lower().replace("_", " ").replace("-", " ")
+        try:
+            return NodeStatus(normalized)
+        except ValueError:
+            choices = ", ".join(self.choices)
+            self.fail(
+                f"'{value}' is not a valid node status. Choose from: {choices}.",
+                param,
+                ctx,
+            )
 
 
 class SampleType(ParamType):

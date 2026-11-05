@@ -8,6 +8,7 @@ from dbt.cli.option_types import (
     YAML,
     ChoiceTuple,
     Package,
+    RetryStatusType,
     SampleType,
     SqlParseOptionsType,
     WarnErrorOptionsType,
@@ -610,6 +611,26 @@ resource_type = _create_option_and_track_env_var(
     cls=MultiOption,
     multiple=True,
     default=(),
+)
+
+retry_statuses = _create_option_and_track_env_var(
+    "--retry-statuses",
+    "--retry-status",
+    envvar=None,
+    help=(
+        "Specify one or more statuses from the previous run that should be retried by "
+        "`dbt retry`. Only statuses that are retryable in the current invocation are "
+        "permitted ('error', 'fail', 'skipped', 'runtime error' (also accepted as "
+        "'runtime_error'), 'partial success' (also accepted as 'partial_success'), and "
+        "'warn' when --warn-error is set). May be specified multiple times and multiple "
+        "statuses may be provided space-separated; duplicate values are treated as a set. "
+        "When omitted, every retryable node from the previous run is retried."
+    ),
+    type=RetryStatusType(),
+    cls=MultiOption,
+    multiple=True,
+    default=(),
+    metavar="STATUS",
 )
 
 sample = _create_option_and_track_env_var(

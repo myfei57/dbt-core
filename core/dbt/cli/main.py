@@ -621,6 +621,7 @@ def run(ctx, **kwargs):
 @p.target_path
 @p.threads
 @p.full_refresh
+@p.retry_statuses
 @requires.postflight
 @requires.preflight
 @requires.profile
